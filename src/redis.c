@@ -5,8 +5,11 @@
 #include "catalog/pg_type.h"
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
+#include "nodes/nodes.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
+#include "utils/typcache.h"
 
 #include <hiredis/hiredis.h>
 #include <stdarg.h>
@@ -377,6 +380,111 @@ redis_command_argv(PG_FUNCTION_ARGS)
 
 }
 
+PG_FUNCTION_INFO_V1(redis_command_table);
+
+extern Datum redis_command_table(PG_FUNCTION_ARGS);
+
+Datum
+redis_command_table(PG_FUNCTION_ARGS)
+{
+	int con_num = PG_GETARG_INT32(0);
+	ArrayType *inargs = PG_GETARG_ARRAYTYPE_P(1);
+
+	char *cmd;
+
+	redisReply *reply = NULL;
+	redisContext *ctx;
+	char * returnval = NULL;
+	Datum      *textargs;
+	bool       *argnulls;
+	int         nargs;
+	char      **args;
+	int         i;
+
+	deconstruct_array(inargs, TEXTOID, -1, false, 'i',
+					  &textargs, &argnulls, &nargs);
+	
+	args = palloc(nargs * sizeof(char *));
+
+	for (i = 0; i < nargs; i++)
+	{
+		if (argnulls[i])
+			args[i] = ""; /* redisCommandArgv doesn't like NULL args */
+		else
+			args[i] = TextDatumGetCString(textargs[i]);
+	}
+
+	cmd = args[0];
+
+	if (con_num < 0 || con_num >= NUM_REDIS_CONTEXTS)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("con_num must be between 0 and %d", 
+						NUM_REDIS_CONTEXTS-1)));
+
+	if (contexts[con_num] == NULL)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("connection number %d is not open", con_num)));
+
+	if (nargs <= 0 || strlen(cmd) == 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("command required")));
+		
+
+	ctx = contexts[con_num];
+
+	reply = redisCommandArgv(ctx,nargs, (const char **) args, NULL);
+
+	if (reply == NULL)
+	{
+			char *ctxerr = pstrdup(ctx->errstr);
+			redisFree(ctx);
+			contexts[con_num] = NULL;
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE), /* ??? */
+					 errmsg("command %s failed: %s:",cmd,ctxerr)));
+
+	}
+
+	if (reply->type == REDIS_REPLY_ERROR)
+	{
+		char *reperr = pstrdup(reply->str);
+		freeReplyObject(reply);
+		/* the context is still valid, we just had a command failure */
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE), /* ??? */
+				 errmsg("command %s failed: %s:",cmd,reperr)));
+	}
+
+	switch (reply->type)
+	{
+		case REDIS_REPLY_STRING:
+			pg_verifymbstr(reply->str, reply->len, false);
+		case REDIS_REPLY_STATUS:
+			/* assume status reply encoding is ok */
+			returnval = pstrdup(reply->str);
+			break;
+		case REDIS_REPLY_INTEGER:
+			returnval = palloc(32);
+			snprintf(returnval,32,"%lld",reply->integer);
+			break;
+		case REDIS_REPLY_NIL:
+			/* returnval = "nil"; */
+			returnval = "";
+			break;
+		case REDIS_REPLY_ARRAY:
+			returnval = get_reply_array(reply);
+			break;
+		default:
+			break;
+	}
+
+	PG_RETURN_TEXT_P(CStringGetTextDatum(returnval));
+
+}
+
 
 /*
  * XXX need proper array quoting and nesting 
@@ -423,3 +531,203 @@ get_reply_array(redisReply *reply)
 	return res->data;
 }
 
+
+PG_FUNCTION_INFO_V1(redis_push_table);
+
+extern Datum redis_push_table(PG_FUNCTION_ARGS);
+
+Datum
+redis_push_table(PG_FUNCTION_ARGS)
+{
+	int con_num = PG_GETARG_INT32(0);
+	Datum row = PG_GETARG_DATUM(1);
+	text *prefix = PG_GETARG_TEXT_P(2);
+	ArrayType *keys = PG_GETARG_ARRAYTYPE_P(3);
+    Datum      *keytext;
+    bool       *keynulls;
+    char      **keystr;
+	char      **keyvals;
+    int         nkeys;
+	char      **args;
+	int         argc;
+	redisReply *reply = NULL;
+	redisContext *ctx;
+	int i,k;
+    HeapTupleHeader td;
+    Oid         tupType;
+    int32       tupTypmod;
+    TupleDesc   tupdesc;
+    HeapTupleData tmptup,
+               *tuple;
+
+	StringInfoData key;
+
+	char *cprefix = text_to_cstring(prefix);
+
+	elog(NOTICE,"argnodes: %s", nodeToString(fcinfo->flinfo->fn_expr));
+
+	if (con_num < 0 || con_num >= NUM_REDIS_CONTEXTS)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("con_num must be between 0 and %d", 
+						NUM_REDIS_CONTEXTS-1)));
+
+	if (contexts[con_num] == NULL)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("connection number %d is not open", con_num)));
+
+	ctx = contexts[con_num];
+
+    if (array_contains_nulls(keys))
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("cannot call %s with null key elements",
+                        "redis_push_table")));
+
+	
+    deconstruct_array(keys, TEXTOID, -1, false, 'i',
+                      &keytext, &keynulls, &nkeys);
+
+	if (nkeys == 0)
+		ereport(
+			ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("cannot call %s with no key elements",
+					"redis_push_table")));
+
+	keystr = palloc(sizeof(char *) * nkeys);
+
+    for (i = 0; i < nkeys; i++)
+    {
+        keystr[i] = TextDatumGetCString(keytext[i]);
+        if (*keystr[i] == '\0')
+            ereport(
+                    ERROR,
+                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                     errmsg("cannot call %s with empty key elements",
+                            "redis_push_table")));
+    }
+
+	keyvals = palloc0(sizeof(char *) * nkeys);
+
+    td = DatumGetHeapTupleHeader(row);
+
+    /* Extract rowtype info and find a tupdesc */
+    tupType = HeapTupleHeaderGetTypeId(td);
+    tupTypmod = HeapTupleHeaderGetTypMod(td);
+    tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
+
+    /* Build a temporary HeapTuple control structure */
+    tmptup.t_len = HeapTupleHeaderGetDatumLength(td);
+    tmptup.t_data = td;
+    tuple = &tmptup;
+
+	args = palloc(sizeof(char *) * (tupdesc->natts * 2 + 2));
+	argc = 2; /* leave space for command name and key */
+	
+	for (i = 0; i < tupdesc->natts; i++)
+	{
+		Datum       val,
+			origval;
+		bool        isnull;
+		char       *attname;
+		Oid         typoutput;
+		bool        typisvarlena;
+		int keycol  = -1;
+		char *outputstr = NULL;
+		
+		if (tupdesc->attrs[i]->attisdropped)
+			continue;
+		
+		attname = NameStr(tupdesc->attrs[i]->attname);
+		for (k = 0; k < nkeys; k++)
+			if ( strcmp(attname, keystr[k]) == 0)
+			{
+				keycol = k;
+				break;
+			}
+
+	    getTypeOutputInfo(tupdesc->attrs[i]->atttypid,
+                          &typoutput, &typisvarlena);
+		
+		origval = heap_getattr(tuple, i + 1, tupdesc, &isnull);
+		if (typisvarlena && !isnull)
+			val = PointerGetDatum(PG_DETOAST_DATUM(origval));
+		else
+			val = origval;
+	
+		if (!isnull)
+			outputstr = OidOutputFunctionCall(typoutput, val);
+
+ 		/* Clean up detoasted copy, if any */
+		if (val != origval)
+			pfree(DatumGetPointer(val));
+
+		if (keycol >= 0)
+		{
+			if (isnull)
+				ereport(
+                    ERROR,
+                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                     errmsg("cannot call %s with null key value (%s)",
+                            "redis_push_table", attname)));
+
+			keyvals[keycol] = outputstr;
+		}
+		else
+		{
+			args[argc++] = attname;
+			args[argc++] = isnull ? "nil" : outputstr;
+		}
+	}
+
+	ReleaseTupleDesc(tupdesc);
+	
+	initStringInfo(&key);
+	appendStringInfoString(&key,cprefix);
+	for (k = 0; k < nkeys; k++)
+	{
+		if (keyvals[k] == NULL)
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("key value for %s not found",keystr[k])));
+		
+		appendStringInfoChar(&key,':');
+		appendStringInfoString(&key,keyvals[k]);
+	}
+
+	args[0] = "HMSET";
+	args[1] = key.data;
+
+	if ((reply = redisCommandArgv(ctx, argc, (const char **) args, NULL)) 
+		== NULL)
+	{
+		char *ctxerr = pstrdup(ctx->errstr);
+		redisFree(ctx);
+		contexts[con_num] = NULL;
+		ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE), /* ??? */
+                 errmsg("table push failure: %s",ctxerr)));
+
+	}
+	else
+	{
+		if (reply->type == REDIS_REPLY_ERROR)
+		{
+			char *reperr = pstrdup(reply->str);
+			freeReplyObject(reply);
+			redisFree(ctx);
+			contexts[con_num] = NULL;
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE), /* ??? */
+					 errmsg("table push failure: %s:",reperr)));
+		}
+		
+		/* prevent memory leak */
+		freeReplyObject(reply);
+	}
+
+	PG_RETURN_NULL();
+}

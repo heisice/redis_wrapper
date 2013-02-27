@@ -5,7 +5,8 @@ CREATE FUNCTION redis_connect(con_num int,
                               con_host text = '127.0.0.1', 
                               con_port int = 6379,
                               con_pass text = '',
-                              con_db int  = 0)
+                              con_db int  = 0,
+                              ignore_duplicate bool = false)
 RETURNS void
 AS 'MODULE_PATHNAME'
 LANGUAGE C;

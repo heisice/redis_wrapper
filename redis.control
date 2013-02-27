@@ -1,5 +1,5 @@
 # redis api extension
 comment = 'Redis API wrapper'
-default_version = '0.0.1'
+default_version = '0.0.2'
 module_pathname = '$libdir/redis'
 relocatable = true

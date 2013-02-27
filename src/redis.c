@@ -35,6 +35,7 @@ redis_connect(PG_FUNCTION_ARGS)
 	int con_port = PG_GETARG_INT32(2);
 	text *con_pass = PG_GETARG_TEXT_P(3);
 	int con_db = PG_GETARG_INT32(4);
+	bool ignore_dup = PG_GETARG_BOOL(5);
 
 	char *chost = text_to_cstring(con_host);
 	char *cpass  = text_to_cstring(con_pass);
@@ -48,9 +49,14 @@ redis_connect(PG_FUNCTION_ARGS)
 						NUM_REDIS_CONTEXTS-1)));
 
 	if (contexts[con_num] != NULL)
+	{
+		if (ignore_dup)
+			PG_RETURN_VOID();
+
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                  errmsg("connection number %d is already open", con_num)));
+	}
 
 	if ((ctx = redisConnect(chost, con_port)) == NULL)
         ereport(ERROR,

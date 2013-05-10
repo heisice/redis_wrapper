@@ -29,14 +29,27 @@ RETURNS text
 AS 'MODULE_PATHNAME' , 'redis_command_argv'
 LANGUAGE C;
 
-CREATE FUNCTION redis_push_table(
-       con_num int,
-       data    record,
-       prefix  text,
-       keys    variadic text[])
+CREATE FUNCTION redis_push_record(
+       con_num       int,
+       data          record,
+       push_keys     boolean,
+       key_set       text,
+       key_prefix    text,
+       key_fields    text[])
 returns void
 AS 'MODULE_PATHNAME'
 LANGUAGE C;
+
+CREATE FUNCTION redis_drop_table(
+       con_num       int,
+       key_set       text DEFAULT NULL,
+       key_prefix    text DEFAULT NULL)
+returns void
+AS 'MODULE_PATHNAME'
+LANGUAGE C;
+
+
+
 
 
 

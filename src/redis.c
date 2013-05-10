@@ -22,6 +22,36 @@ static redisContext *contexts[NUM_REDIS_CONTEXTS];
 
 
 static char *get_reply_array(redisReply *reply);
+static void delete_members(redisContext *ctx, redisReply *reply);
+
+
+static inline void 
+check_reply(int con_num, redisContext *ctx, redisReply *reply, char * msg)
+{
+
+	if (reply == NULL)
+	{
+			char *ctxerr = pstrdup(ctx->errstr);
+			redisFree(ctx);
+			contexts[con_num] = NULL;
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE), /* ??? */
+					 errmsg("%s: %s",msg,ctxerr)));
+
+	}
+
+	if (reply->type == REDIS_REPLY_ERROR)
+	{
+		char *reperr = pstrdup(reply->str);
+		freeReplyObject(reply);
+		/* the context is still valid, we just had a command failure */
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE), /* ??? */
+				 errmsg("%s: %s:",msg,reperr)));
+	}
+
+
+}
 
 PG_FUNCTION_INFO_V1(redis_connect);
 
@@ -66,30 +96,8 @@ redis_connect(PG_FUNCTION_ARGS)
 
 	if (strlen(cpass) > 0)
 	{
-		if ((reply = redisCommand(ctx,"AUTH %s",cpass)) == NULL)
-		{
-			char *ctxerr = pstrdup(ctx->errstr);
-			redisFree(ctx);
-			ereport(ERROR,
-                (errcode(ERRCODE_INVALID_PARAMETER_VALUE), /* ??? */
-                 errmsg("failed to authenticate to redis: %s:",ctxerr)));
-
-		}
-		else
-		{
-			if (reply->type == REDIS_REPLY_ERROR)
-			{
-				char *reperr = pstrdup(reply->str);
-				freeReplyObject(reply);
-				redisFree(ctx);
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE), /* ??? */
-						 errmsg("failed to authenticate to redis: %s:",reperr)));
-			}
-
-			/* prevent memory leak */
-			freeReplyObject(reply);
-		}
+		reply = redisCommand(ctx,"AUTH %s",cpass);
+		check_reply(con_num, ctx, reply, "authenitcation failure");
 	}
 
 	if (con_db != 0)
@@ -98,30 +106,8 @@ redis_connect(PG_FUNCTION_ARGS)
 		
 		snprintf(arg,32, "%d", con_db);
 
-		if ((reply = redisCommand(ctx,"SELECT %s",arg)) == NULL)
-		{
-			char *ctxerr = pstrdup(ctx->errstr);
-			redisFree(ctx);
-			ereport(ERROR,
-                (errcode(ERRCODE_INVALID_PARAMETER_VALUE), /* ??? */
-                 errmsg("failed to select db %d: %s:",con_db,ctxerr)));
-
-		}
-		else
-		{
-			if (reply->type == REDIS_REPLY_ERROR)
-			{
-				char *reperr = pstrdup(reply->str);
-				freeReplyObject(reply);
-				redisFree(ctx);
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE), /* ??? */
-						 errmsg("failed to select db %d: %s:",con_db,reperr)));
-			}
-
-			/* prevent memory leak */
-			freeReplyObject(reply);
-		}
+		reply = redisCommand(ctx,"SELECT %s",arg);
+		check_reply(con_num, ctx, reply, "selecting db failure");
 	}
 
 	/* everything is kosher, so save the connection */
@@ -180,6 +166,10 @@ redis_command(PG_FUNCTION_ARGS)
 	char      **args;
 	int         i;
 
+	char failmsg[1024];
+
+	snprintf(failmsg, sizeof(failmsg),"command %s failed",cmd);
+
 	deconstruct_array(inargs, TEXTOID, -1, false, 'i',
 					  &textargs, &argnulls, &nargs);
 	
@@ -206,12 +196,6 @@ redis_command(PG_FUNCTION_ARGS)
 
 	ctx = contexts[con_num];
 
-
-/*
-	elog(NOTICE,"passing %d args",nargs);
-	for (i = 0; i < nargs; i++)
-		elog(NOTICE,"args[%d]: %s",i,args[i]);
-*/
 	switch(nargs)
 	{
 		case 0: 
@@ -236,26 +220,7 @@ redis_command(PG_FUNCTION_ARGS)
 					 errdetail("You might need to use redis_command_argv() instead.")));
 	}
 
-	if (reply == NULL)
-	{
-			char *ctxerr = pstrdup(ctx->errstr);
-			redisFree(ctx);
-			contexts[con_num] = NULL;
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE), /* ??? */
-					 errmsg("command %s failed: %s:",cmd,ctxerr)));
-
-	}
-
-	if (reply->type == REDIS_REPLY_ERROR)
-	{
-		char *reperr = pstrdup(reply->str);
-		freeReplyObject(reply);
-		/* the context is still valid, we just had a command failure */
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE), /* ??? */
-				 errmsg("command %s failed: %s:",cmd,reperr)));
-	}
+	check_reply(con_num, ctx, reply,failmsg);
 
 	switch (reply->type)
 	{
@@ -301,6 +266,7 @@ redis_command_argv(PG_FUNCTION_ARGS)
 	int         nargs;
 	char      **args;
 	int         i;
+	char failmsg[1024];
 
 	deconstruct_array(inargs, TEXTOID, -1, false, 'i',
 					  &textargs, &argnulls, &nargs);
@@ -316,6 +282,8 @@ redis_command_argv(PG_FUNCTION_ARGS)
 	}
 
 	cmd = args[0];
+
+	snprintf(failmsg, sizeof(failmsg),"command %s failed",cmd);
 
 	if (con_num < 0 || con_num >= NUM_REDIS_CONTEXTS)
         ereport(ERROR,
@@ -338,131 +306,7 @@ redis_command_argv(PG_FUNCTION_ARGS)
 
 	reply = redisCommandArgv(ctx,nargs, (const char **) args, NULL);
 
-	if (reply == NULL)
-	{
-			char *ctxerr = pstrdup(ctx->errstr);
-			redisFree(ctx);
-			contexts[con_num] = NULL;
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE), /* ??? */
-					 errmsg("command %s failed: %s:",cmd,ctxerr)));
-
-	}
-
-	if (reply->type == REDIS_REPLY_ERROR)
-	{
-		char *reperr = pstrdup(reply->str);
-		freeReplyObject(reply);
-		/* the context is still valid, we just had a command failure */
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE), /* ??? */
-				 errmsg("command %s failed: %s:",cmd,reperr)));
-	}
-
-	switch (reply->type)
-	{
-		case REDIS_REPLY_STRING:
-			pg_verifymbstr(reply->str, reply->len, false);
-		case REDIS_REPLY_STATUS:
-			/* assume status reply encoding is ok */
-			returnval = pstrdup(reply->str);
-			break;
-		case REDIS_REPLY_INTEGER:
-			returnval = palloc(32);
-			snprintf(returnval,32,"%lld",reply->integer);
-			break;
-		case REDIS_REPLY_NIL:
-			/* returnval = "nil"; */
-			returnval = "";
-			break;
-		case REDIS_REPLY_ARRAY:
-			returnval = get_reply_array(reply);
-			break;
-		default:
-			break;
-	}
-
-	PG_RETURN_TEXT_P(CStringGetTextDatum(returnval));
-
-}
-
-PG_FUNCTION_INFO_V1(redis_command_table);
-
-extern Datum redis_command_table(PG_FUNCTION_ARGS);
-
-Datum
-redis_command_table(PG_FUNCTION_ARGS)
-{
-	int con_num = PG_GETARG_INT32(0);
-	ArrayType *inargs = PG_GETARG_ARRAYTYPE_P(1);
-
-	char *cmd;
-
-	redisReply *reply = NULL;
-	redisContext *ctx;
-	char * returnval = NULL;
-	Datum      *textargs;
-	bool       *argnulls;
-	int         nargs;
-	char      **args;
-	int         i;
-
-	deconstruct_array(inargs, TEXTOID, -1, false, 'i',
-					  &textargs, &argnulls, &nargs);
-	
-	args = palloc(nargs * sizeof(char *));
-
-	for (i = 0; i < nargs; i++)
-	{
-		if (argnulls[i])
-			args[i] = ""; /* redisCommandArgv doesn't like NULL args */
-		else
-			args[i] = TextDatumGetCString(textargs[i]);
-	}
-
-	cmd = args[0];
-
-	if (con_num < 0 || con_num >= NUM_REDIS_CONTEXTS)
-        ereport(ERROR,
-                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                 errmsg("con_num must be between 0 and %d", 
-						NUM_REDIS_CONTEXTS-1)));
-
-	if (contexts[con_num] == NULL)
-        ereport(ERROR,
-                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                 errmsg("connection number %d is not open", con_num)));
-
-	if (nargs <= 0 || strlen(cmd) == 0)
-        ereport(ERROR,
-                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                 errmsg("command required")));
-		
-
-	ctx = contexts[con_num];
-
-	reply = redisCommandArgv(ctx,nargs, (const char **) args, NULL);
-
-	if (reply == NULL)
-	{
-			char *ctxerr = pstrdup(ctx->errstr);
-			redisFree(ctx);
-			contexts[con_num] = NULL;
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE), /* ??? */
-					 errmsg("command %s failed: %s:",cmd,ctxerr)));
-
-	}
-
-	if (reply->type == REDIS_REPLY_ERROR)
-	{
-		char *reperr = pstrdup(reply->str);
-		freeReplyObject(reply);
-		/* the context is still valid, we just had a command failure */
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE), /* ??? */
-				 errmsg("command %s failed: %s:",cmd,reperr)));
-	}
+	check_reply(con_num, ctx, reply, failmsg);
 
 	switch (reply->type)
 	{
@@ -493,66 +337,31 @@ redis_command_table(PG_FUNCTION_ARGS)
 
 
 /*
- * XXX need proper array quoting and nesting 
+ * SQL function redis_push_table
+ *
+ * push the record with the given keyset and prefix as a hash record
+ *
  */
 
+PG_FUNCTION_INFO_V1(redis_push_record);
 
-static char *
-get_reply_array(redisReply *reply)
-{
-	StringInfo res = makeStringInfo();
-	int i;
-	bool need_sep = false;
-
-	appendStringInfoChar(res,'{');
-	for (i = 0; i < reply->elements; i++)
-	{
-		redisReply *ir = reply->element[i];
-		if (need_sep)
-			appendStringInfoChar(res,',');
-		need_sep = true;
-		if (ir->type == REDIS_REPLY_ARRAY)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE), /* ??? */
-					 errmsg("nested array returns not yet supported")));
-		switch (ir->type)
-		{
-			case REDIS_REPLY_STATUS:
-			case REDIS_REPLY_STRING:
-				pg_verifymbstr(ir->str, ir->len, false);
-				appendStringInfoString(res,ir->str);
-				break;
-			case REDIS_REPLY_INTEGER:
-				appendStringInfo(res,"%lld",ir->integer);
-				break;
-			case REDIS_REPLY_NIL:
-				/* appendStringInfoString(res,"nil"); */
-				break;
-			default:
-				break;
-		}
-	}
-	appendStringInfoChar(res,'}');
-	
-	return res->data;
-}
-
-
-PG_FUNCTION_INFO_V1(redis_push_table);
-
-extern Datum redis_push_table(PG_FUNCTION_ARGS);
+extern Datum redis_push_record(PG_FUNCTION_ARGS);
 
 Datum
-redis_push_table(PG_FUNCTION_ARGS)
+redis_push_record(PG_FUNCTION_ARGS)
 {
 	int con_num = PG_GETARG_INT32(0);
 	Datum row = PG_GETARG_DATUM(1);
-	text *prefix = PG_GETARG_TEXT_P(2);
-	ArrayType *keys = PG_GETARG_ARRAYTYPE_P(3);
+	bool push_keys = PG_GETARG_BOOL(2);
+	text *keysetname = PG_GETARG_TEXT_P(3);
+	text *prefix = PG_GETARG_TEXT_P(4);
+	ArrayType *keys = PG_GETARG_ARRAYTYPE_P(5);
+
     Datum      *keytext;
     bool       *keynulls;
     char      **keystr;
 	char      **keyvals;
+	char       *keyset = NULL;
     int         nkeys;
 	char      **args;
 	int         argc;
@@ -570,7 +379,32 @@ redis_push_table(PG_FUNCTION_ARGS)
 
 	char *cprefix = text_to_cstring(prefix);
 
-	elog(NOTICE,"argnodes: %s", nodeToString(fcinfo->flinfo->fn_expr));
+	if (PG_ARGISNULL(0))
+	{
+		elog(ERROR,"must provide non-null redis connection");
+	}
+	if (PG_ARGISNULL(1))
+	{
+		elog(ERROR,"must provide non-null record");
+	}
+	if (PG_ARGISNULL(2))
+	{
+		push_keys = false;
+	}
+	if (! PG_ARGISNULL(3))
+	{
+		keyset = text_to_cstring(keysetname);
+	}
+	if (PG_ARGISNULL(4))
+	{
+		elog(ERROR,"must provide non-null table prefix");
+	}
+	if (PG_ARGISNULL(5))
+	{
+		elog(ERROR,"must provide non-null list of key names");
+	}
+
+	/* elog(NOTICE,"argnodes: %s", nodeToString(fcinfo->flinfo->fn_expr)); */
 
 	if (con_num < 0 || con_num >= NUM_REDIS_CONTEXTS)
         ereport(ERROR,
@@ -681,7 +515,7 @@ redis_push_table(PG_FUNCTION_ARGS)
 
 			keyvals[keycol] = outputstr;
 		}
-		else
+		if (keycol == 0 || push_keys)
 		{
 			args[argc++] = attname;
 			args[argc++] = isnull ? "nil" : outputstr;
@@ -704,36 +538,212 @@ redis_push_table(PG_FUNCTION_ARGS)
 		appendStringInfoString(&key,keyvals[k]);
 	}
 
+	/* clean out any data we have for this key */
+	reply = redisCommand(ctx, "DEL %s", key.data);
+
+	check_reply(con_num, ctx, reply, "record delete failure");
+
+	/* add the data */
+
 	args[0] = "HMSET";
 	args[1] = key.data;
 
-	if ((reply = redisCommandArgv(ctx, argc, (const char **) args, NULL)) 
-		== NULL)
-	{
-		char *ctxerr = pstrdup(ctx->errstr);
-		redisFree(ctx);
-		contexts[con_num] = NULL;
-		ereport(ERROR,
-                (errcode(ERRCODE_INVALID_PARAMETER_VALUE), /* ??? */
-                 errmsg("table push failure: %s",ctxerr)));
+	reply = redisCommandArgv(ctx, argc, (const char **) args, NULL);
 
-	}
-	else
+	check_reply(con_num, ctx, reply,"record push failure");
+
+	/* if we're keeping a keyset, add that too */
+
+	if (keyset != NULL)
 	{
-		if (reply->type == REDIS_REPLY_ERROR)
-		{
-			char *reperr = pstrdup(reply->str);
-			freeReplyObject(reply);
-			redisFree(ctx);
-			contexts[con_num] = NULL;
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE), /* ??? */
-					 errmsg("table push failure: %s:",reperr)));
-		}
-		
-		/* prevent memory leak */
-		freeReplyObject(reply);
+		reply = redisCommand(ctx, "SADD %s %s", keyset, key.data);
+
+		check_reply(con_num, ctx, reply, "keyset add failure");
 	}
 
 	PG_RETURN_NULL();
 }
+
+
+/*
+ * SQL function redis_drop_table
+ *
+ * Drop the "table" designated by the given prefix or keyset
+ * i.e. a redis set containing the keys of the table.
+ * If the keyset is given, drop that too.
+ *
+ */
+
+PG_FUNCTION_INFO_V1(redis_drop_table);
+
+extern Datum redis_drop_table(PG_FUNCTION_ARGS);
+
+Datum
+redis_drop_table(PG_FUNCTION_ARGS)
+{
+	int con_num = PG_GETARG_INT32(0);
+
+	redisReply *reply = NULL;
+	redisContext *ctx;
+
+	char * keysetname = NULL;
+	char cmd[1024];
+
+	if (PG_ARGISNULL(1) == PG_ARGISNULL(2))
+	{
+		elog(ERROR,"must have exactly one keyset or prefix argument not null");
+	}
+
+	if (con_num < 0 || con_num >= NUM_REDIS_CONTEXTS)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("con_num must be between 0 and %d", 
+						NUM_REDIS_CONTEXTS-1)));
+
+	if (contexts[con_num] == NULL)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("connection number %d is not open", con_num)));
+
+	ctx = contexts[con_num];
+
+	if (PG_ARGISNULL(2))
+	{
+		/* keyset case */
+		keysetname = text_to_cstring(PG_GETARG_TEXT_P(1));
+		
+		snprintf(cmd, sizeof(cmd),"SMEMBERS %s",keysetname);
+	}
+	else
+	{
+		/* prefix case */
+		char *prefixstr = text_to_cstring(PG_GETARG_TEXT_P(2));
+		
+		snprintf(cmd, sizeof(cmd),"KEYS %s*",prefixstr);
+	}
+
+	reply = redisCommand(ctx,cmd);
+		
+	if (reply->type == REDIS_REPLY_ERROR)
+	{
+		char *reperr = pstrdup(reply->str);
+		freeReplyObject(reply);
+		/* the context is still valid, we just had a command failure */
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE), /* ??? */
+				 errmsg("command %s failed: %s:",
+						cmd,reperr)));
+	}
+	
+	switch (reply->type)
+	{
+		case REDIS_REPLY_ARRAY:
+			delete_members(ctx,reply);
+			break;
+		default:
+			elog(ERROR, "unexpected reply type for %s",cmd);
+			break;
+	}
+
+	freeReplyObject(reply);
+
+	if (keysetname != NULL)
+	{
+		/* if there's a keyset we delete it too */
+		reply = redisCommand(ctx,"DEL %s",keysetname);
+
+		if (reply->type == REDIS_REPLY_ERROR)
+		{
+			char *reperr = pstrdup(reply->str);
+			freeReplyObject(reply);
+			/* the context is still valid, we just had a command failure */
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE), /* ??? */
+					 errmsg("command DEL %s failed: %s:",
+							keysetname,reperr)));
+		}
+		
+		freeReplyObject(reply);		
+	}	
+	PG_RETURN_VOID();
+}
+
+
+static void 
+delete_members(redisContext *ctx, redisReply *reply)
+{
+
+	int i;
+
+	for( i = 0; i < reply->elements; i++)
+	{
+		redisReply *ir = reply->element[i];
+		redisReply *droprepl;
+		switch (ir->type)
+		{
+			case REDIS_REPLY_STRING:
+				droprepl = redisCommand(ctx,"DEL %s",ir->str);
+				if (droprepl->type == REDIS_REPLY_ERROR)
+				{
+					char *reperr = pstrdup(reply->str);
+					freeReplyObject(droprepl);
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE), /* ??? */
+							 errmsg("command DEL %s failed: %s:",
+									ir->str, reperr)));
+				}
+				
+				break;
+			default:
+				elog(ERROR,"unexpected reply type");
+				break;
+		}
+	}
+}
+
+/*
+ * XXX need proper array quoting and nesting 
+ */
+
+
+static char *
+get_reply_array(redisReply *reply)
+{
+	StringInfo res = makeStringInfo();
+	int i;
+	bool need_sep = false;
+
+	appendStringInfoChar(res,'{');
+	for (i = 0; i < reply->elements; i++)
+	{
+		redisReply *ir = reply->element[i];
+		if (need_sep)
+			appendStringInfoChar(res,',');
+		need_sep = true;
+		if (ir->type == REDIS_REPLY_ARRAY)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE), /* ??? */
+					 errmsg("nested array returns not yet supported")));
+		switch (ir->type)
+		{
+			case REDIS_REPLY_STATUS:
+			case REDIS_REPLY_STRING:
+				pg_verifymbstr(ir->str, ir->len, false);
+				appendStringInfoString(res,ir->str);
+				break;
+			case REDIS_REPLY_INTEGER:
+				appendStringInfo(res,"%lld",ir->integer);
+				break;
+			case REDIS_REPLY_NIL:
+				/* appendStringInfoString(res,"nil"); */
+				break;
+			default:
+				break;
+		}
+	}
+	appendStringInfoChar(res,'}');
+	
+	return res->data;
+}
+
+

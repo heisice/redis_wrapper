@@ -1,0 +1,160 @@
+-- our connection handle is 1, the redis db is number 15 on localhost
+select redis_connect(1, con_db:=15);
+ redis_connect 
+---------------
+ 
+(1 row)
+
+-- make sure the db is empty
+\set ON_ERROR_STOP
+do $$
+  declare
+    retval text;
+  begin 
+    select into retval redis_command(1,'KEYS *');
+    if retval != '{}'
+    then
+       raise EXCEPTION 'db 15 not empty';
+    end if;
+  end;
+$$;
+\unset ON_ERROR_STOP
+-- basic set and get
+select redis_command(1,'SET %s %s','string_key','foo');
+ redis_command 
+---------------
+ OK
+(1 row)
+
+select redis_command(1,'SET %s %s','int_key','1');
+ redis_command 
+---------------
+ OK
+(1 row)
+
+select redis_command(1,'INCRBY %s %s','int_key','5');
+ redis_command 
+---------------
+ 6
+(1 row)
+
+select redis_command(1,'GET %s','string_key');
+ redis_command 
+---------------
+ foo
+(1 row)
+
+select redis_command(1,'GET %s','int_key');
+ redis_command 
+---------------
+ 6
+(1 row)
+
+-- redis_command_argv lets you use as many args as you like
+select redis_command_argv(1,'HMSET','foo:'||id,
+            'data1','val '|| id+99,
+            'data2', 'val ' || id+299) 
+    from generate_series(0,9) as id;
+ redis_command_argv 
+--------------------
+ OK
+ OK
+ OK
+ OK
+ OK
+ OK
+ OK
+ OK
+ OK
+ OK
+(10 rows)
+
+-- look at what we just put in redis
+select 'foo:' || id as key, 
+       (redis_command(1,'HGETALL %s','foo:'||id)::text[]) as vals
+    from generate_series(0,9) as id;
+  key  |               vals                
+-------+-----------------------------------
+ foo:0 | {data1,"val 99",data2,"val 299"}
+ foo:1 | {data1,"val 100",data2,"val 300"}
+ foo:2 | {data1,"val 101",data2,"val 301"}
+ foo:3 | {data1,"val 102",data2,"val 302"}
+ foo:4 | {data1,"val 103",data2,"val 303"}
+ foo:5 | {data1,"val 104",data2,"val 304"}
+ foo:6 | {data1,"val 105",data2,"val 305"}
+ foo:7 | {data1,"val 106",data2,"val 306"}
+ foo:8 | {data1,"val 107",data2,"val 307"}
+ foo:9 | {data1,"val 108",data2,"val 308"}
+(10 rows)
+
+-- prepare to push records
+create temp table abc (id int, id2 int, t text);
+insert into abc 
+   select id, 99-id, 'blurfl ' || (157 - id)
+   from generate_series(0,9) as id;
+-- push the records as a table with a key set
+select count(*) from (
+   select redis_push_record(1,r,true,'abcset','abc','{id,id2}') from abc r) a;
+ count 
+-------
+    10
+(1 row)
+
+-- select the data from the pushed table
+-- normally you would use the FDW to do this more naturally
+with keys as
+(
+        select unnest(redis_command(1,'SMEMBERS abcset')::text[]) as key
+        order by 1
+)
+select key, redis_command(1,'HGETALL %s',key)::text[] as vals 
+from keys;
+   key    |             vals             
+----------+------------------------------
+ abc:0:99 | {id,0,id2,99,t,"blurfl 157"}
+ abc:1:98 | {id,1,id2,98,t,"blurfl 156"}
+ abc:2:97 | {id,2,id2,97,t,"blurfl 155"}
+ abc:3:96 | {id,3,id2,96,t,"blurfl 154"}
+ abc:4:95 | {id,4,id2,95,t,"blurfl 153"}
+ abc:5:94 | {id,5,id2,94,t,"blurfl 152"}
+ abc:6:93 | {id,6,id2,93,t,"blurfl 151"}
+ abc:7:92 | {id,7,id2,92,t,"blurfl 150"}
+ abc:8:91 | {id,8,id2,91,t,"blurfl 149"}
+ abc:9:90 | {id,9,id2,90,t,"blurfl 148"}
+(10 rows)
+
+-- drop the table
+select redis_drop_table(1,key_set:='abcset');
+ redis_drop_table 
+------------------
+ 
+(1 row)
+
+-- show that the keyset is gone
+select redis_command(1,'SMEMBERS abcset');
+ redis_command 
+---------------
+ {}
+(1 row)
+
+-- and the table hashes too
+select redis_command(1,'KEYS abc:*');
+ redis_command 
+---------------
+ {}
+(1 row)
+
+--clean up
+select redis_command(1,'FLUSHALL');
+ redis_command 
+---------------
+ OK
+(1 row)
+
+select redis_disconnect(1);
+ redis_disconnect 
+------------------
+ 
+(1 row)
+
+drop table abc;

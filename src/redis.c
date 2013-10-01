@@ -2,6 +2,9 @@
 
 #include "fmgr.h"
 #include "funcapi.h"
+#if PG_VERSION_NUM >= 90300
+#include "access/htup_details.h"
+#endif
 #include "catalog/pg_type.h"
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
